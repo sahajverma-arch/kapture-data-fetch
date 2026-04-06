@@ -17,17 +17,18 @@ end_date   = today.strftime("%m/%d/%Y")
 print(f"Fetching report: {start_date} → {end_date}")
  
 # ── Kapture API config ────────────────────────────────────────────────────────
-KAPTURE_URL = "https://fitelo.kapturecrm.com/ms/kreport/generic-report/generate"
-COOKIE      = os.environ["KAPTURE_COOKIE"]
+KAPTURE_URL     = "https://fitelo.kapturecrm.com/ms/kreport/generic-report/generate"
+REPORT_LIST_URL = "https://fitelo.kapturecrm.com/ms/kreport/generic-report/list"
+COOKIE          = os.environ["KAPTURE_COOKIE"]
  
 HEADERS = {
-    "Content-Type":    "application/x-www-form-urlencoded",
-    "Accept":          "application/json, text/plain, */*",
-    "Origin":          "https://fitelo.kapturecrm.com",
-    "Referer":         "https://fitelo.kapturecrm.com/nui/report",
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    "Cookie":          COOKIE,
-    "x-kaptrace-id":   "c05e33d4-a013-421e-a899-8b0bd1d85e0c##1000171###181179",
+    "Content-Type":  "application/x-www-form-urlencoded",
+    "Accept":        "application/json, text/plain, */*",
+    "Origin":        "https://fitelo.kapturecrm.com",
+    "Referer":       "https://fitelo.kapturecrm.com/nui/report",
+    "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Cookie":        COOKIE,
+    "x-kaptrace-id": "c05e33d4-a013-421e-a899-8b0bd1d85e0c##1000171###181179",
 }
  
 PAYLOAD = {
@@ -56,107 +57,123 @@ PAYLOAD = {
     "keyword":                   "",
 }
  
+# ── Helper: search report list for a completed download URL ──────────────────
+def find_download_url_from_list():
+    print("Checking report list for a completed job...")
+    try:
+        r = requests.get(REPORT_LIST_URL, headers={**HEADERS, "Content-Type": "application/json"}, timeout=30)
+        print(f"  List status: {r.status_code} | body[:500]: {r.text[:500]}")
+        data = r.json()
+        items = data if isinstance(data, list) else (
+            data.get("data") or data.get("reports") or data.get("list") or []
+        )
+        for item in items:
+            url = (item.get("fileUrl") or item.get("file_url") or
+                   item.get("url") or item.get("downloadUrl") or
+                   item.get("s3Url") or item.get("s3_url") or "")
+            if url and url.startswith("http"):
+                print(f"  Found URL in list: {url}")
+                return url
+    except Exception as e:
+        print(f"  Could not fetch report list: {e}")
+    return None
+ 
 # ── Step 1: Trigger report generation ────────────────────────────────────────
 print("Triggering report generation...")
 resp = requests.post(KAPTURE_URL, headers=HEADERS, data=PAYLOAD, timeout=60)
  
-# Always print full response details for debugging
 print(f"Status code : {resp.status_code}")
 print(f"Content-Type: {resp.headers.get('Content-Type', 'not set')}")
-print(f"Response body (first 1000 chars):\n{resp.text[:1000]}")
+print(f"Response body: {resp.text[:500]}")
  
-# Check for auth failure / redirect
-if resp.status_code in (401, 403):
-    raise Exception("Auth failed — cookie is invalid or expired. Update KAPTURE_COOKIE secret.")
+duplicate_request = "duplicate" in resp.text.lower() or "already processing" in resp.text.lower()
  
-if resp.status_code == 302 or "login" in resp.url.lower():
-    raise Exception(f"Redirected to login page ({resp.url}) — cookie expired.")
- 
-if not resp.text.strip():
-    raise Exception(
-        "Empty response from Kapture API.\n"
-        "Most likely cause: cookie is expired or was not copied fully.\n"
-        "Fix: go to Chrome → DevTools → copy the full Cookie header again → update KAPTURE_COOKIE secret."
-    )
- 
-# ── Step 2: Parse response ────────────────────────────────────────────────────
-try:
-    result = resp.json()
-except Exception:
-    # Not JSON — maybe a direct CSV download?
-    content_type = resp.headers.get("Content-Type", "")
-    if "text/csv" in content_type or "application/octet-stream" in content_type:
-        print("Response is a direct CSV download — processing immediately.")
-        rows = list(csv.reader(io.StringIO(resp.content.decode("utf-8-sig"))))
-        result = None   # skip polling, jump straight to Sheets
-    else:
-        raise Exception(
-            f"Could not parse API response as JSON.\n"
-            f"Status: {resp.status_code}\n"
-            f"Content-Type: {content_type}\n"
-            f"Body: {resp.text[:500]}"
-        )
-else:
-    rows = None   # will be populated after polling/download
-    print(f"Parsed JSON response: {result}")
- 
-# ── Step 3: Get download URL (if not direct CSV) ──────────────────────────────
+# ── Step 2: Parse response or handle duplicate ────────────────────────────────
 download_url = None
+rows = None
  
-if rows is None:
-    # Pattern A: URL directly in response
-    for key in ("fileUrl", "file_url", "url", "downloadUrl", "download_url", "s3Url", "s3_url", "data"):
-        val = result.get(key)
-        if val and isinstance(val, str) and val.startswith("http"):
-            download_url = val
-            print(f"Found download URL under key '{key}': {download_url}")
+if duplicate_request:
+    print("Duplicate request detected — polling report list for existing job result...")
+    for attempt in range(18):
+        time.sleep(10)
+        print(f"  Attempt {attempt + 1}/18...")
+        download_url = find_download_url_from_list()
+        if download_url:
             break
- 
-    # Pattern B: nested under result.data or result.response
     if not download_url:
-        for wrapper in ("data", "response", "result"):
-            nested = result.get(wrapper)
-            if isinstance(nested, dict):
-                for key in ("fileUrl", "file_url", "url", "downloadUrl", "s3Url"):
-                    val = nested.get(key)
-                    if val and isinstance(val, str) and val.startswith("http"):
-                        download_url = val
-                        print(f"Found download URL at {wrapper}.{key}: {download_url}")
+        raise TimeoutError("Existing report job did not complete within 3 minutes. Try again shortly.")
+else:
+    try:
+        result = resp.json()
+        print(f"Parsed JSON: {result}")
+    except Exception:
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/csv" in content_type or "application/octet-stream" in content_type:
+            print("Direct CSV response — processing immediately.")
+            rows = list(csv.reader(io.StringIO(resp.content.decode("utf-8-sig"))))
+            result = None
+        else:
+            raise Exception(f"Unexpected response:\nStatus: {resp.status_code}\nBody: {resp.text[:500]}")
+ 
+    if rows is None and result is not None:
+        for key in ("fileUrl", "file_url", "url", "downloadUrl", "download_url", "s3Url", "s3_url"):
+            val = result.get(key)
+            if val and isinstance(val, str) and val.startswith("http"):
+                download_url = val
+                print(f"Found URL under key '{key}': {download_url}")
+                break
+ 
+        if not download_url:
+            for wrapper in ("data", "response", "result"):
+                nested = result.get(wrapper)
+                if isinstance(nested, dict):
+                    for key in ("fileUrl", "file_url", "url", "downloadUrl", "s3Url"):
+                        val = nested.get(key)
+                        if val and isinstance(val, str) and val.startswith("http"):
+                            download_url = val
+                            print(f"Found URL at {wrapper}.{key}: {download_url}")
+                            break
+ 
+        if not download_url:
+            job_id = (result.get("jobId") or result.get("job_id") or
+                      result.get("taskId") or result.get("task_id"))
+            if job_id:
+                status_url = f"https://fitelo.kapturecrm.com/ms/kreport/generic-report/status/{job_id}"
+                print(f"Polling job {job_id}...")
+                for attempt in range(18):
+                    time.sleep(10)
+                    s = requests.get(status_url, headers=HEADERS, timeout=30)
+                    print(f"  poll {attempt+1}: {s.status_code} | {s.text[:200]}")
+                    try:
+                        sdata = s.json()
+                    except Exception:
+                        continue
+                    for key in ("fileUrl", "file_url", "url", "downloadUrl", "s3Url"):
+                        val = sdata.get(key)
+                        if val and isinstance(val, str) and val.startswith("http"):
+                            download_url = val
+                            break
+                    if download_url:
                         break
+                else:
+                    raise TimeoutError("Report job did not complete within 3 minutes.")
  
-    # Pattern C: job/task ID — poll status endpoint
-    if not download_url:
-        job_id = (result.get("jobId") or result.get("job_id")
-                  or result.get("taskId") or result.get("task_id"))
-        if job_id:
-            status_url = f"https://fitelo.kapturecrm.com/ms/kreport/generic-report/status/{job_id}"
-            print(f"Polling job {job_id} at {status_url}")
-            for attempt in range(18):   # up to 3 minutes
+        if not download_url:
+            print("No URL found in response — checking report list as fallback...")
+            for attempt in range(12):
                 time.sleep(10)
-                s = requests.get(status_url, headers=HEADERS, timeout=30)
-                print(f"  poll {attempt+1}: status={s.status_code} body={s.text[:200]}")
-                try:
-                    sdata = s.json()
-                except Exception:
-                    continue
-                for key in ("fileUrl", "file_url", "url", "downloadUrl", "s3Url"):
-                    val = sdata.get(key)
-                    if val and isinstance(val, str) and val.startswith("http"):
-                        download_url = val
-                        break
+                download_url = find_download_url_from_list()
                 if download_url:
                     break
-            else:
-                raise TimeoutError("Report not ready after 3 minutes of polling.")
  
-    if not download_url:
-        raise ValueError(
-            f"Could not find a download URL in the API response.\n"
-            f"Full response: {json.dumps(result, indent=2)}\n\n"
-            "Please share this output so the script can be updated with the correct key name."
-        )
+        if not download_url:
+            raise ValueError(
+                f"Could not find a download URL anywhere.\n"
+                f"Full API response: {json.dumps(result, indent=2)}\n\n"
+                "Paste this output so the script can be updated."
+            )
  
-# ── Step 4: Download CSV ──────────────────────────────────────────────────────
+# ── Step 3: Download CSV ──────────────────────────────────────────────────────
 if rows is None:
     print(f"Downloading CSV from: {download_url}")
     csv_resp = requests.get(download_url, timeout=120)
@@ -169,17 +186,16 @@ if not rows:
  
 print(f"CSV rows (including header): {len(rows)}")
  
-# ── Step 5: Push to Google Sheets ────────────────────────────────────────────
+# ── Step 4: Push to Google Sheets ────────────────────────────────────────────
 creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
 scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
 creds      = Credentials.from_service_account_info(creds_info, scopes=scopes)
 gc         = gspread.authorize(creds)
  
-sheet_id   = os.environ["GOOGLE_SHEET_ID"]
-sh         = gc.open_by_key(sheet_id)
+sheet_id = os.environ["GOOGLE_SHEET_ID"]
+sh       = gc.open_by_key(sheet_id)
  
-# Write to a tab named after today's date e.g. "2026-04-06"
-tab_name   = today.strftime("%Y-%m-%d")
+tab_name = today.strftime("%Y-%m-%d")
 try:
     ws = sh.worksheet(tab_name)
     ws.clear()
@@ -191,7 +207,6 @@ except gspread.exceptions.WorksheetNotFound:
 ws.update(rows, value_input_option="RAW")
 print(f"✅ Done! {len(rows)-1} data rows written to tab '{tab_name}'.")
  
-# Also keep a 'Latest' tab always up to date
 try:
     latest_ws = sh.worksheet("Latest")
     latest_ws.clear()
